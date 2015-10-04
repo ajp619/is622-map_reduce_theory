@@ -1,0 +1,345 @@
+---
+title: "Matrix Multiplication"
+author: "Aaron Palumbo"
+date: "9/12/2015"
+output: pdf_document
+toc: yes
+---
+
+# Matrix Multiplication
+
+We are going to use Map Reduce to multiply together two matrices, both of size $n \times n$. For reference we assume the following terms $M \cdot N = P$.
+
+## Generate the Matrices
+
+We will write the matrices to a local file, then transfer that file to hdfs. We do this to simulate working with matrices that are too big to fit into memory.
+
+The file will be in csv format with the following information:
+--matrix, row, column, value
+
+Here matrix will be either M or N
+
+```{r}
+##################
+# Run Parameters #
+##################
+# verify algorithm is working 
+# - this will attempt to load the matrices into
+# - memory and multiply using conventional means
+
+verify  <- TRUE 
+# easier to check if things are working if FALSE
+randVals <- FALSE
+
+##############
+# File Setup #
+##############
+# We will use this method to simulate working with a matrix
+# that is too big for memory
+fn <- "matrix.csv"
+if (file.exists(fn)) file.remove(fn)
+
+##########################
+# Matrix Characteristics #
+##########################
+
+## size of matrix (n x n square) 
+# -- both M and N are the same size
+n <- 6
+
+## row column groups
+# -- we will be breaking down the matrix into groups 
+# -- of rows and columns. How many per group?
+g <- 2
+
+## density of matrix (0-1)
+# this value corresponds to the probability of
+# entry i,j not being 0
+p <- 1
+
+## max value - maximum value for entry in matrix (integer)
+maxVal <- 10
+
+#####################
+# Generate Matrices #
+#####################
+
+create_paste_function <- function(fileName){
+  f <- function(matName, i, j, value){
+    cat(paste0(matName, ", ", i, ", ", j, ", ", value),
+        file=fileName,
+        sep="\n",
+        append=TRUE)
+  }
+  return(f)
+}
+
+append_to_file <- create_paste_function(fn)
+
+return_val <- function(i, j, randVals=TRUE){
+  if (randVals){
+        return(as.integer(runif(1, 1, maxVal)))
+      } else {
+        return(i + j)
+      }
+}
+
+# Stream data to file
+for (i in 1:n){
+  for (j in 1:n){
+    if (rbinom(1, 1, p) == 1){
+      append_to_file("M", i, j, return_val(i, j, randVals))
+    }
+    if (rbinom(1, 1, p) == 1){
+      append_to_file("N", i, j, return_val(i, j, randVals))
+    }
+  }
+}
+
+###########################
+# Read Matrices from file #
+###########################
+# This is for debugging
+
+if (verify){
+  # read M and N into memory
+  df <- read.csv(fn, header=FALSE)
+  names(df) <- c("name", "i", "j", "val")
+  
+  df <- df[order(df$name, df$j, df$i), ]
+  
+  matList <- list(M=matrix(0, nrow=n, ncol=n),
+                  N=matrix(0, nrow=n, ncol=n))
+  
+  for (r in 1:nrow(df)){
+    matList[[df$name[r]]][df$i[r], df$j[r]] <- df$val[r]
+  }
+}
+
+if (exists("matList")){
+  matList$M
+  matList$N
+}
+
+```
+
+## Push matrices into hdfs
+
+```{r}
+library(rhdfs)
+hdfs.init()
+
+hdfs_dir <- "/user/apalumbo/mat_mul/"
+
+hdfs.put(fn, hdfs_dir)  # this will overwrite
+```
+
+## Matrix Multiplication with Map Reduce
+
+### Group Hash
+
+We will be breaking down the matrix into a grid for processing. Each cell in the grid will be g rows by g cols. Here we set up a hash function to sort row or column numbers into the correct grid.
+
+```{r}
+create_groupHash <- function(groups){
+  f <- function(num){
+    return(as.integer((num + groups - 1) / groups))
+  }
+  return(f)
+}
+
+groupHash <- create_groupHash(g)
+
+maxg <- groupHash(n)
+```
+
+### First Iteration
+
+input line of the form: c(matrix, row, column, value)
+map (m, r, c, v) to   key: (keyHash(r), keyHash(c), 1:(ceiling(n/g)))
+                    value: (m, r, c, v)
+map (n, r, c, v) to   key: (1:ceiling(n/g), keyHash(r), keyHash(c))
+                    value: (n, r, c, v)
+
+First Reduce:
+key: (i, j, k)
+will have a value list like, for example, this:
+m, 1, 1, m11
+m, 1, 2, m12
+m, 2, 1, m21
+m, 2, 2, m22
+n, 1, 1, n11
+n, 1, 2, n12
+n, 2, 1, n21
+n, 2, 2, n22
+
+output: key: (i, k)
+values: 
+for each key in m:
+--r = r(m)
+--j = c(m)
+--for each key in n where r(n) == j:
+----c = c(n)
+----# there will only be one pair that fits this
+----create key value{key: (i, k) value: (r, c, mrj * njc)}
+
+combiner: now locally combine keys:
+
+(first reduce is also second map)
+
+```{r}
+library(rmr2)
+
+mapper <- function(null, val){
+  mat <- val[1]
+  r <- as.numeric(val[[2]])
+  c <- as.numeric(val[[3]])
+  entry <- as.numeric(val[[4]])
+  colNames <- c('matrix', 'row', 'col', 'value')
+  names(val) <- colNames
+  df.m <- val[val$matrix == 'M', ]
+  df.m['i'] <- groupHash(df.m$r)
+  df.m['j'] <- groupHash(df.m$c)
+  
+  df.n <- val[val$matrix == 'N', ]
+  df.n['j'] <- groupHash(df.n$r)
+  df.n['k'] <- groupHash(df.n$c)
+  
+  list.df <- list()
+  for (g in maxg){
+    df.m['k'] <- g
+    df.n['i'] <- g
+    curLen <- length(list.df)
+    list.df[[curLen + 1]] <- df.m
+    list.df[[curLen + 2]] <- df.n
+  }
+  df <- do.call(rbind, list.df)
+  
+  return(
+    keyval(df[ ,c('i', 'j', 'k')], df[ , colNames])
+    )
+}
+
+reducer <- function(key, val){
+  df.key <- data.frame(
+    i=key[[1]],
+    k=key[[3]]
+    )
+  v <- length(val)
+  return(keyval(key, val))
+}
+
+path <- paste0(hdfs_dir, fn)
+hdfsFile <- hdfs.file(path, "r")
+
+mr <- mapreduce(
+  input = paste0(hdfs_dir, fn), 
+  input.format = make.input.format(format="csv", sep=","), 
+  map = mapper,
+  reduce = reducer
+  )
+
+if (exists('result')){
+  rm(result)
+}
+
+result <- from.dfs(mr)
+
+result
+```
+
+
+final map:
+
+sum values
+
+
+```{r, eval=FALSE}
+###############
+# Simple Test #
+###############
+
+mapper <- function(null, val){
+  m <- val[[1]]
+  r <- val[[2]]
+  c <- val[[3]]
+  s <- val[[4]]
+  v <- val[[5]]
+  
+  if (m == 'm'){
+    df.key <- data.frame(r=c(r, r),
+                         c=c(1, 2))
+  }
+  if (m == 'n'){
+    df.key <- data.frame(r=c(1, 2),
+                         c=c(c, c))
+  }
+  return(keyval(df.key, v))
+}
+
+reducer <- function(key, val.list){
+  return(keyval(key, val.list))
+}
+
+small.df <- data.frame(m=c(rep('m', 4), rep('n', 4)),
+                       r=c(1, 1, 2, 2, 1, 1, 2, 2),
+                       c=c(1, 2, 1, 2, 1, 2, 1, 2),
+                       s=letters[1:8],
+                       v=1:8)
+
+mat <- to.dfs(small.df)
+mr <- mapreduce(input=mat, map=mapper, reduce=reducer)
+if (exists('result')){
+  rm(result)
+}
+
+result <- from.dfs(mr)
+
+print(cbind(result$key, result$val))
+
+lst <- list()
+for (i in 1:nrow(small.df)){
+  r <- mapper(0, small.df[i,])
+  lst[[i]] <- cbind(r$key, r$val)
+}
+do.call(rbind, lst)
+```
+
+
+```{r}
+###################
+# Delete this one #
+###################
+
+library(rmr2)
+
+mapper <- function(null, val){
+  mat <- val[1]
+  r <- val[2]
+  c <- val[3]
+  entry <- as.numeric(val[[4]])
+  
+  k <- data.frame(i=r, j=c, k=1:maxg)
+  v <- data.frame(m=mat, i=r, j=c, v=entry)
+  return(keyval(k, v))
+}
+
+reducer <- function(key, val){
+  return(keyval(key, val))
+}
+
+path <- paste0(hdfs_dir, fn)
+hdfsFile <- hdfs.file(path, "r")
+
+mr <- mapreduce(
+  input = paste0(hdfs_dir, fn), 
+  input.format = make.input.format(format="csv", sep=","), 
+  map = mapper,
+  reduce = reducer
+  )
+
+result <- from.dfs(mr)
+
+result
+```
+
